@@ -1,0 +1,48 @@
+name: 功能或修改方案
+description: 提交一个需要讨论和实现的修改方案
+title: "[方案] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: "提交前请阅读 limitation.md。新增 MCP、数据源或外部写操作必须先修改规范并获得确认。"
+  - type: textarea
+    id: goal
+    attributes:
+      label: 目标与使用场景
+      description: 当前问题是什么，谁会使用，完成后应得到什么结果？
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: 建议修改
+      description: 涉及页面、工作流、数据模型、MCP、存储或导出的哪些部分？
+    validations:
+      required: true
+  - type: dropdown
+    id: boundary
+    attributes:
+      label: 是否触及限制边界
+      options:
+        - 否，只修改现有能力
+        - 是，新增 MCP 或数据源
+        - 是，新增外部写操作
+        - 不确定，需要先评审
+    validations:
+      required: true
+  - type: textarea
+    id: data
+    attributes:
+      label: 数据来源与可信度
+      description: 列出外部来源、是否实时、验证方式和失败时的降级方式。
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      description: 用可测试的条件描述完成标准。
+    validations:
+      required: true
+
