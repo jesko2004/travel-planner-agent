@@ -1,0 +1,44 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "项目：创建虚拟环境",
+      "type": "shell",
+      "command": "python",
+      "args": ["-m", "venv", ".venv"],
+      "problemMatcher": []
+    },
+    {
+      "label": "项目：安装依赖",
+      "type": "shell",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "pip", "install", "-r", "requirements.txt"],
+      "dependsOn": ["项目：创建虚拟环境"],
+      "problemMatcher": []
+    },
+    {
+      "label": "项目：运行 Streamlit",
+      "type": "shell",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "streamlit", "run", "app.py"],
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "项目：运行测试",
+      "type": "shell",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "pytest", "-q"],
+      "group": {"kind": "test", "isDefault": true},
+      "problemMatcher": []
+    },
+    {
+      "label": "项目：语法检查",
+      "type": "shell",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "compileall", "-q", "app.py", "travel_planner", "tests"],
+      "problemMatcher": []
+    }
+  ]
+}
+
