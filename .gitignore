@@ -1,0 +1,13 @@
+.env
+.streamlit/secrets.toml
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+.pytest_cache/
+.venv/
+*.pyc
+.coverage
+htmlcov/
+.idea/
+.DS_Store

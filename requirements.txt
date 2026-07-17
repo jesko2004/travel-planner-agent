@@ -1,0 +1,7 @@
+streamlit>=1.40
+agno>=2.2.10
+openai>=1.50
+icalendar>=6.0
+pydantic>=2.8
+pytest>=8.0
+
