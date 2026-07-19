@@ -75,6 +75,7 @@ def database_itinerary() -> Itinerary:
         }
     )
     first_activity = Activity(
+        activity_id="activity-13812345678",
         day=request.start_date,
         start_time=time(9, 0),
         end_time=time(11, 0),
@@ -82,6 +83,7 @@ def database_itinerary() -> Itinerary:
         estimated_cost=50,
     )
     second_activity = Activity(
+        activity_id="activity-second",
         day=request.start_date,
         start_time=time(12, 0),
         end_time=time(14, 0),
@@ -518,6 +520,28 @@ def test_sensitive_legacy_payload_is_not_duplicated_into_backup(
 
     assert secret not in str(error.value)
     assert _user_version(database_path) == 0
+    assert repository.last_backup_path is None
+    assert not (tmp_path / "backups").exists()
+
+
+def test_sensitive_legacy_phone_is_rejected_before_backup(
+    tmp_path, database_itinerary
+):
+    database_path = tmp_path / "travel.db"
+    _create_legacy_database(
+        database_path,
+        profile_payload=json.dumps(
+            {"food_restrictions": ["13812345678"]}, ensure_ascii=True
+        ),
+        itinerary_payload=database_itinerary.model_dump_json(),
+        itinerary=database_itinerary,
+    )
+
+    repository = SQLiteRepository(database_path)
+    with pytest.raises(SensitiveDataError) as error:
+        repository.initialize()
+
+    assert "13812345678" not in str(error.value)
     assert repository.last_backup_path is None
     assert not (tmp_path / "backups").exists()
 

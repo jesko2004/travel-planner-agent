@@ -67,6 +67,16 @@ _PASSWORD_RE = re.compile(
 )
 _NATIONAL_ID_RE = re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)")
 _PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_LABELED_NATIONAL_ID_RE = re.compile(
+    r"(?:身份证(?:号)?|national\s*id)\s*[:：=]\s*\d{17}[0-9Xx]",
+    re.IGNORECASE,
+)
+_LABELED_PHONE_RE = re.compile(
+    r"(?:手机号|手机号码|联系电话|联系方式|电话|"
+    r"phone(?:\s*number)?|mobile|tel(?:ephone)?)"
+    r"\s*[:：=]\s*1[3-9]\d{9}",
+    re.IGNORECASE,
+)
 _BANK_CARD_RE = re.compile(r"(?<!\d)(?:\d[ -]?){15,18}\d(?!\d)")
 _LABELED_BANK_CARD_RE = re.compile(
     r"(?:银行卡|卡号|bank\s*card)\s*[:：=]\s*(?:\d[ -]?){12,18}\d",
@@ -105,7 +115,11 @@ def _luhn_valid(digits: str) -> bool:
     return total % 10 == 0
 
 
-def _categories_in_text(value: str) -> set[SensitiveDataCategory]:
+def _categories_in_text(
+    value: str,
+    *,
+    include_unlabeled_numeric: bool = True,
+) -> set[SensitiveDataCategory]:
     categories: set[SensitiveDataCategory] = set()
     if _PRIVATE_KEY_RE.search(value):
         categories.add(SensitiveDataCategory.PRIVATE_KEY)
@@ -115,16 +129,20 @@ def _categories_in_text(value: str) -> set[SensitiveDataCategory]:
         categories.add(SensitiveDataCategory.COOKIE)
     if _PASSWORD_RE.search(value):
         categories.add(SensitiveDataCategory.PASSWORD)
-    if _NATIONAL_ID_RE.search(value):
+    if _LABELED_NATIONAL_ID_RE.search(value) or (
+        include_unlabeled_numeric and _NATIONAL_ID_RE.search(value)
+    ):
         categories.add(SensitiveDataCategory.NATIONAL_ID)
-    if _PHONE_RE.search(value):
+    if _LABELED_PHONE_RE.search(value) or (
+        include_unlabeled_numeric and _PHONE_RE.search(value)
+    ):
         categories.add(SensitiveDataCategory.PHONE)
     if _HOME_ADDRESS_RE.search(value):
         categories.add(SensitiveDataCategory.HOME_ADDRESS)
 
     if _LABELED_BANK_CARD_RE.search(value):
         categories.add(SensitiveDataCategory.BANK_CARD)
-    else:
+    elif include_unlabeled_numeric:
         for match in _BANK_CARD_RE.finditer(value):
             digits = re.sub(r"\D", "", match.group(0))
             if _NATIONAL_ID_RE.fullmatch(digits):
@@ -133,6 +151,22 @@ def _categories_in_text(value: str) -> set[SensitiveDataCategory]:
                 categories.add(SensitiveDataCategory.BANK_CARD)
                 break
     return categories
+
+
+_LIST_INDEX_SUFFIX_RE = re.compile(r"(?:\[\d+\])+$")
+_OPAQUE_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+
+
+def _field_name_from_path(field_path: str) -> str:
+    final_component = field_path.rsplit(".", 1)[-1].lower()
+    return _LIST_INDEX_SUFFIX_RE.sub("", final_component)
+
+
+def _is_opaque_identifier_value(field_name: str, value: str) -> bool:
+    """Return whether a value is a controlled machine reference, not prose."""
+
+    is_identifier_field = field_name == "id" or field_name.endswith(("_id", "_ids"))
+    return is_identifier_field and _OPAQUE_IDENTIFIER_RE.fullmatch(value) is not None
 
 
 def _walk_values(value: object, path: str = "request") -> Iterable[tuple[str, object]]:
@@ -155,6 +189,7 @@ def find_sensitive_data(
     *,
     root_field: str = "request",
     forbidden_values: Iterable[str] = (),
+    include_unlabeled_numeric: bool = True,
 ) -> list[SensitiveDataFinding]:
     """Return only safe field/category metadata, never matched source fragments."""
 
@@ -169,7 +204,7 @@ def find_sensitive_data(
         root_items = [(root_field, value)]
 
     for field_path, item in root_items:
-        field_name = field_path.rsplit(".", 1)[-1].lower()
+        field_name = _field_name_from_path(field_path)
         field_category = _SENSITIVE_FIELD_NAMES.get(field_name)
         if field_category is not None and item not in (None, "", [], {}):
             findings.append(SensitiveDataFinding(field=field_path, category=field_category))
@@ -183,7 +218,13 @@ def find_sensitive_data(
                 )
             findings.extend(
                 SensitiveDataFinding(field=field_path, category=category)
-                for category in _categories_in_text(item)
+                for category in _categories_in_text(
+                    item,
+                    include_unlabeled_numeric=(
+                        include_unlabeled_numeric
+                        and not _is_opaque_identifier_value(field_name, item)
+                    ),
+                )
             )
     return findings
 
@@ -193,11 +234,13 @@ def reject_sensitive_data(
     *,
     root_field: str = "request",
     forbidden_values: Iterable[str] = (),
+    include_unlabeled_numeric: bool = True,
 ) -> None:
     findings = find_sensitive_data(
         value,
         root_field=root_field,
         forbidden_values=forbidden_values,
+        include_unlabeled_numeric=include_unlabeled_numeric,
     )
     if findings:
         raise SensitiveDataError(findings)

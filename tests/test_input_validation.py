@@ -9,6 +9,7 @@ from travel_planner.services.input_validation import (
     SensitiveDataCategory,
     SensitiveDataError,
     build_request_digest,
+    find_sensitive_data,
     normalize_trip_request,
 )
 
@@ -75,6 +76,53 @@ def test_loaded_bare_key_is_rejected_by_exact_value_without_echo():
         )
     assert configured_key not in str(captured.value)
     assert captured.value.findings[0].category == SensitiveDataCategory.API_KEY
+
+
+def test_opaque_identifiers_do_not_trigger_unlabeled_phone_detection():
+    findings = find_sensitive_data(
+        {
+            "activity_id": "activity-13812345678",
+            "origin_activity_id": "13812345678",
+            "approved_poi_ids": ["13812345678"],
+        },
+        root_field="itinerary",
+    )
+    assert findings == []
+
+
+def test_opaque_identifier_still_rejects_exact_loaded_key():
+    configured_key = "a1" * 16
+    findings = find_sensitive_data(
+        {"activity_id": configured_key},
+        root_field="itinerary",
+        forbidden_values=[configured_key],
+    )
+    assert [(finding.field, finding.category) for finding in findings] == [
+        ("itinerary.activity_id", SensitiveDataCategory.API_KEY)
+    ]
+
+
+@pytest.mark.parametrize(
+    "category,value",
+    [
+        (SensitiveDataCategory.PHONE, "手机号: 13812345678"),
+        (SensitiveDataCategory.PHONE, "电话: 13812345678"),
+        (SensitiveDataCategory.PHONE, "联系方式: 13812345678"),
+        (SensitiveDataCategory.PHONE, "tel: 13812345678"),
+        (
+            SensitiveDataCategory.NATIONAL_ID,
+            "身份证: 11010519491231002X",
+        ),
+    ],
+)
+def test_labeled_numeric_pii_in_opaque_identifier_is_still_rejected(
+    category, value
+):
+    findings = find_sensitive_data(
+        {"activity_id": value},
+        root_field="itinerary",
+    )
+    assert category in {finding.category for finding in findings}
 
 
 def test_ordinary_extra_field_is_forbidden():

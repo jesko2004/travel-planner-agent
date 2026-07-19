@@ -60,5 +60,5 @@
 - 已完成证据 TTL、四级状态、严格输入、运行时裸 Key denylist、最小化 DTO、确定性校验和 Streamlit 最小兼容展示。
 - SQLite 已使用 `user_version=1`，旧库在解析和敏感扫描后备份，再执行事务迁移与逐 ID 回读；历史状态按当前北京时间只降不升。
 - 无可审计高德工具调用记录的数据由适配层固定为 `unverified`，外部 DTO 不接受可直接生效的验证状态或不可信导航 URL。
-- 本地 Python 3.12 实际执行 `compileall` 成功、`pytest` 81 项通过、`git diff --check` 通过、凭证值与禁止跟踪文件扫描通过。
+- 本地 Python 3.12 实际执行 `compileall` 成功、`pytest` 89 项通过、`git diff --check` 通过、凭证值与禁止跟踪文件扫描通过；机器 ID 的无标签数字误报与带标签敏感内容已有固定回归测试。
 - 草稿 PR #3 已创建，Python 3.10/3.12 GitHub Actions 均通过；未执行真实 DeepSeek/高德集成测试。

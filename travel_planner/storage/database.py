@@ -296,17 +296,23 @@ class SQLiteRepository:
             rows = connection.execute(f"SELECT data_json FROM {table}").fetchall()
             for index, row in enumerate(rows):
                 raw_payload = row["data_json"]
-                reject_sensitive_data(
-                    raw_payload,
-                    root_field=f"legacy_{table}[{index}]",
-                    forbidden_values=self._forbidden_values,
-                )
                 try:
                     parsed_payload = json.loads(raw_payload)
                 except (json.JSONDecodeError, TypeError):
                     # The transactional migration will report malformed JSON;
-                    # raw scanning above still prevents obvious plaintext leaks.
+                    # raw scanning still prevents obvious plaintext leaks.
+                    reject_sensitive_data(
+                        raw_payload,
+                        root_field=f"legacy_{table}[{index}]",
+                        forbidden_values=self._forbidden_values,
+                    )
                     continue
+                reject_sensitive_data(
+                    raw_payload,
+                    root_field=f"legacy_{table}[{index}]",
+                    forbidden_values=self._forbidden_values,
+                    include_unlabeled_numeric=False,
+                )
                 reject_sensitive_data(
                     parsed_payload,
                     root_field=f"legacy_{table}[{index}]",
