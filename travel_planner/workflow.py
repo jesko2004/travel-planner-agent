@@ -11,17 +11,27 @@ from travel_planner.models import (
     Activity,
     BudgetSummary,
     DayPlan,
+    EvidenceKind,
     HotelCandidate,
     Itinerary,
+    LockedActivitySnapshot,
     PoiCandidate,
     ResearchBundle,
     RouteLeg,
     SourceEvidence,
     TripRequest,
+    ValidationContext,
+    ValidationIssue,
     VerificationStatus,
     WeatherInfo,
+    beijing_now,
 )
 from travel_planner.services.hotel_links import build_hotel_platform_links
+from travel_planner.services.input_validation import (
+    build_request_digest,
+    normalize_trip_request,
+    reject_sensitive_data,
+)
 from travel_planner.services.model_client import DeepSeekPlanner
 from travel_planner.services.validator import ItineraryValidator
 from travel_planner.storage.database import SQLiteRepository
@@ -52,6 +62,7 @@ def check_health(settings: Settings, repository: SQLiteRepository) -> HealthStat
     messages: list[str] = []
     database_ready = True
     try:
+        repository.set_forbidden_values(settings.sensitive_values)
         repository.initialize()
     except Exception as exc:
         database_ready = False
@@ -78,6 +89,9 @@ class TravelPlannerWorkflow:
     def __init__(self, settings: Settings, repository: SQLiteRepository) -> None:
         self.settings = settings
         self.repository = repository
+        configure_secrets = getattr(repository, "set_forbidden_values", None)
+        if callable(configure_secrets):
+            configure_secrets(settings.sensitive_values)
         self.planner = DeepSeekPlanner(settings)
         self.validator = ItineraryValidator()
 
@@ -94,10 +108,11 @@ class TravelPlannerWorkflow:
                 poi_id=f"unverified-{index}",
                 name=name,
                 address="待高德确认",
-                longitude=0,
-                latitude=0,
+                longitude=None,
+                latitude=None,
                 category="未验证候选",
                 evidence=SourceEvidence(
+                    kind=EvidenceKind.POI_LOCATION,
                     source="用户输入",
                     tool_name="none",
                     is_realtime=False,
@@ -115,12 +130,20 @@ class TravelPlannerWorkflow:
             "自驾优先": "驾车",
         }[request.local_transport]
 
+    @staticmethod
+    def _poi_coordinate(poi: PoiCandidate) -> str | None:
+        if poi.longitude is None or poi.latitude is None:
+            return None
+        if not (73.0 <= poi.longitude <= 135.0 and 3.0 <= poi.latitude <= 54.0):
+            return None
+        return f"{poi.longitude:.6f},{poi.latitude:.6f}"
+
     def _build_itinerary(
         self,
         request: TripRequest,
         draft,
         research: ResearchBundle,
-        amap_available: bool,
+        research_succeeded: bool,
         locked_activities: list[Activity] | None = None,
     ) -> Itinerary:
         poi_lookup = {poi.poi_id: poi for poi in research.pois}
@@ -185,19 +208,25 @@ class TravelPlannerWorkflow:
             local_transport_estimate=round(50 * persons * request.days, 2),
             food_estimate=round(150 * persons * request.days, 2),
         )
-        evidence = (
+        weather_evidence = (
             SourceEvidence(
+                kind=EvidenceKind.CURRENT_WEATHER,
                 source="高德地图",
-                tool_name="weather",
-                is_realtime=True,
-                status=VerificationStatus.VERIFIED,
+                tool_name="amap_mcp_untrusted_adapter",
+                raw_identifier=request.destination,
+                is_realtime=False,
+                status=VerificationStatus.UNVERIFIED,
             )
-            if amap_available and research.weather_summary
+            if research_succeeded and research.weather_summary
             else None
         )
         warnings = []
-        if not amap_available:
+        if not research_succeeded:
             warnings.append("高德服务不可用：当前仅为未验证草案，地址、天气和路线不可作为出行依据。")
+        else:
+            warnings.append(
+                "高德查询结果尚无可审计的真实工具调用记录，当前统一按未验证数据展示。"
+            )
         if skipped:
             warnings.append(f"模型引用了 {len(skipped)} 个候选列表外的 POI，已由程序移除。")
         if not hotels:
@@ -205,6 +234,7 @@ class TravelPlannerWorkflow:
 
         return Itinerary(
             request=request,
+            request_digest=build_request_digest(request),
             title=draft.title,
             overview=draft.overview,
             days=days,
@@ -212,10 +242,19 @@ class TravelPlannerWorkflow:
             weather=WeatherInfo(
                 summary=research.weather_summary or "天气待高德确认",
                 packing_advice=research.packing_advice,
-                evidence=evidence,
+                evidence=weather_evidence,
             ),
             budget=budget,
             warnings=warnings,
+            validation_issues=[
+                ValidationIssue(
+                    severity="error",
+                    code="unknown_poi",
+                    message=f"草案引用了候选白名单外的 POI：{poi_id}",
+                    suggestion="仅从已批准候选中选择活动",
+                )
+                for poi_id in dict.fromkeys(skipped)
+            ],
             alternative_poi_ids=[*draft.alternative_poi_ids, *skipped],
         )
 
@@ -223,6 +262,8 @@ class TravelPlannerWorkflow:
     def _shift_for_route(day_plan: DayPlan, route_index: int, travel_minutes: int, day_end) -> None:
         current = day_plan.activities[route_index]
         following = day_plan.activities[route_index + 1]
+        if following.locked:
+            return
         earliest = datetime.combine(following.day, current.end_time) + timedelta(
             minutes=travel_minutes + 15
         )
@@ -242,6 +283,9 @@ class TravelPlannerWorkflow:
         locked_activities: list[Activity] | None = None,
     ) -> WorkflowResult:
         stage_messages: list[str] = []
+        request = normalize_trip_request(
+            request, forbidden_values=self.settings.sensitive_values
+        )
         self._notify(progress, "需求标准化", "输入已通过类型、日期和预算校验")
 
         amap_available = False
@@ -258,7 +302,7 @@ class TravelPlannerWorkflow:
                         research.pois.append(locked.poi)
                         known_ids.add(locked.poi.poi_id)
                 amap_available = True
-                stage_messages.append("高德目的地、天气、POI 和酒店候选查询完成")
+                stage_messages.append("高德查询完成；可信工具记录适配器尚未接入，结果保持未验证")
 
                 self._notify(progress, "行程草案", "正在使用 DeepSeek 生成结构化草案")
                 draft = await self.planner.create_draft(
@@ -273,20 +317,22 @@ class TravelPlannerWorkflow:
                     for index in range(max(0, len(day_plan.activities) - 1)):
                         origin = day_plan.activities[index]
                         destination = day_plan.activities[index + 1]
-                        route = await client.route(
-                            f"{origin.poi.longitude},{origin.poi.latitude}",
-                            f"{destination.poi.longitude},{destination.poi.latitude}",
-                            self._transport_label(request),
-                        )
-                        evidence = (
-                            SourceEvidence(
-                                source="高德地图",
-                                tool_name="route_planning",
-                                is_realtime=True,
-                                status=VerificationStatus.VERIFIED,
+                        origin_coordinate = self._poi_coordinate(origin.poi)
+                        destination_coordinate = self._poi_coordinate(destination.poi)
+                        if origin_coordinate is None or destination_coordinate is None:
+                            day_plan.route_legs.append(
+                                RouteLeg(
+                                    origin_activity_id=origin.activity_id,
+                                    destination_activity_id=destination.activity_id,
+                                    transport_mode=self._transport_label(request),
+                                    summary="活动缺少有效 GCJ-02 坐标，路线未查询",
+                                )
                             )
-                            if route.verified
-                            else None
+                            continue
+                        route = await client.route(
+                            origin_coordinate,
+                            destination_coordinate,
+                            self._transport_label(request),
                         )
                         day_plan.route_legs.append(
                             RouteLeg(
@@ -297,7 +343,7 @@ class TravelPlannerWorkflow:
                                 duration_minutes=route.duration_minutes,
                                 summary=route.summary,
                                 navigation_url=route.navigation_url,
-                                evidence=evidence,
+                                evidence=route.evidence,
                             )
                         )
                         if route.duration_minutes is not None:
@@ -327,8 +373,30 @@ class TravelPlannerWorkflow:
             )
 
         self._notify(progress, "确定性校验", "正在检查日期、时间、路线、步行量和预算")
-        self.validator.apply_status(itinerary, amap_available)
+        context = ValidationContext(
+            now=beijing_now(),
+            destination_confirmed=research.destination_confirmed,
+            approved_poi_ids={poi.poi_id for poi in research.pois},
+            locked_activities=[
+                LockedActivitySnapshot.from_activity(activity)
+                for activity in (locked_activities or [])
+            ],
+            required_stages={
+                "normalize_request": True,
+                "research_destination": True,
+                "create_draft": True,
+                "enrich_routes": True,
+            },
+        )
+        self.validator.apply_status(itinerary, context)
 
+        # Pre-save privacy gate. A sensitive model/tool result is rejected, not
+        # misreported as a database failure or returned to the page.
+        reject_sensitive_data(
+            itinerary,
+            root_field="itinerary",
+            forbidden_values=self.settings.sensitive_values,
+        )
         saved = False
         try:
             self.repository.save_itinerary(itinerary)

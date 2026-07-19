@@ -23,6 +23,16 @@ class Settings:
     def amap_ready(self) -> bool:
         return bool(self.amap_api_key)
 
+    @property
+    def sensitive_values(self) -> tuple[str, ...]:
+        """Loaded credential values used only for exact-match rejection gates."""
+
+        return tuple(
+            value
+            for value in (self.deepseek_api_key, self.amap_api_key)
+            if len(value) >= 8
+        )
+
 
 def _secret(secrets: Mapping[str, Any] | None, name: str) -> str:
     if secrets:

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, time
+from datetime import date
+from pathlib import Path
 
 import streamlit as st
 from pydantic import ValidationError
@@ -9,6 +10,7 @@ from pydantic import ValidationError
 from travel_planner.config import load_settings
 from travel_planner.models import Itinerary, TripRequest, UserProfile, VerificationStatus
 from travel_planner.services.calendar_export import generate_ics
+from travel_planner.services.input_validation import SensitiveDataError
 from travel_planner.storage.database import SQLiteRepository
 from travel_planner.workflow import TravelPlannerWorkflow, check_health
 
@@ -25,9 +27,7 @@ def get_secrets() -> dict[str, str]:
 
 @st.cache_resource
 def get_repository(database_path: str) -> SQLiteRepository:
-    repository = SQLiteRepository(load_settings(get_secrets()).database_path)
-    repository.initialize()
-    return repository
+    return SQLiteRepository(Path(database_path))
 
 
 def csv_list(value: str) -> list[str]:
@@ -38,17 +38,58 @@ def parse_child_ages(value: str) -> list[int]:
     return [int(item) for item in csv_list(value)] if value.strip() else []
 
 
+def validation_error_text(error: ValidationError) -> str:
+    fields = sorted(
+        {".".join(str(part) for part in item["loc"]) for item in error.errors()}
+    )
+    return "输入字段未通过校验：" + "、".join(fields)
+
+
 def status_text(status: VerificationStatus) -> str:
     return {
-        VerificationStatus.VERIFIED: "✅ 已完成高德验证",
+        VerificationStatus.VERIFIED: "✅ 已验证",
         VerificationStatus.UNVERIFIED: "⚠️ 未验证草案",
+        VerificationStatus.EXPIRED: "🟠 证据已过期，请重新查询",
         VerificationStatus.DRAFT: "📝 草案",
     }[status]
 
 
+def evidence_text(label: str, evidence) -> str:
+    return (
+        f"{label} ｜ {evidence.source}/{evidence.tool_name} ｜ "
+        f"查询 {evidence.checked_at:%Y-%m-%d %H:%M %Z} ｜ "
+        f"过期 {evidence.expires_at:%Y-%m-%d %H:%M %Z} ｜ "
+        f"{evidence.status.value}"
+    )
+
+
+def itinerary_evidences(itinerary: Itinerary) -> list:
+    values = []
+    for day_plan in itinerary.days:
+        values.extend(activity.poi.evidence for activity in day_plan.activities)
+        values.extend(
+            route.evidence for route in day_plan.route_legs if route.evidence is not None
+        )
+    values.extend(hotel.poi.evidence for hotel in itinerary.hotels)
+    if itinerary.weather and itinerary.weather.evidence:
+        values.append(itinerary.weather.evidence)
+    return values
+
+
 def render_itinerary(itinerary: Itinerary) -> bool:
     st.header(itinerary.title)
-    st.subheader(status_text(itinerary.status))
+    if itinerary.status == VerificationStatus.EXPIRED:
+        st.warning(status_text(itinerary.status))
+    elif itinerary.status == VerificationStatus.UNVERIFIED:
+        st.error(status_text(itinerary.status))
+    else:
+        st.subheader(status_text(itinerary.status))
+    expired_count = sum(
+        evidence.status == VerificationStatus.EXPIRED
+        for evidence in itinerary_evidences(itinerary)
+    )
+    if expired_count and itinerary.status != VerificationStatus.EXPIRED:
+        st.warning(f"🟠 当前有 {expired_count} 项证据已过期，请重新查询后再作为出行依据。")
     st.write(itinerary.overview)
 
     if itinerary.warnings:
@@ -143,10 +184,42 @@ def render_itinerary(itinerary: Itinerary) -> bool:
         for day_plan in itinerary.days:
             for activity in day_plan.activities:
                 evidence = activity.poi.evidence
-                st.caption(
-                    f"{activity.poi.name} ｜ {evidence.source}/{evidence.tool_name} ｜ "
-                    f"{evidence.checked_at:%Y-%m-%d %H:%M} ｜ {evidence.status.value}"
+                renderer = (
+                    st.warning
+                    if evidence.status == VerificationStatus.EXPIRED
+                    else st.caption
                 )
+                renderer(evidence_text(activity.poi.name, evidence))
+            for route in day_plan.route_legs:
+                if route.evidence:
+                    evidence = route.evidence
+                    renderer = (
+                        st.warning
+                        if evidence.status == VerificationStatus.EXPIRED
+                        else st.caption
+                    )
+                    renderer(
+                        evidence_text(
+                            f"路线 {route.origin_activity_id} → {route.destination_activity_id}",
+                            evidence,
+                        )
+                    )
+        for hotel in itinerary.hotels:
+            evidence = hotel.poi.evidence
+            renderer = (
+                st.warning
+                if evidence.status == VerificationStatus.EXPIRED
+                else st.caption
+            )
+            renderer(evidence_text(f"酒店 {hotel.poi.name}", evidence))
+        if itinerary.weather and itinerary.weather.evidence:
+            evidence = itinerary.weather.evidence
+            renderer = (
+                st.warning
+                if evidence.status == VerificationStatus.EXPIRED
+                else st.caption
+            )
+            renderer(evidence_text("天气", evidence))
 
     st.download_button(
         "下载分时日历（ICS）",
@@ -163,6 +236,7 @@ def render_itinerary(itinerary: Itinerary) -> bool:
 
 settings = load_settings(get_secrets())
 repository = get_repository(str(settings.database_path))
+repository.set_forbidden_values(settings.sensitive_values)
 health = check_health(settings, repository)
 
 if "itinerary" not in st.session_state:
@@ -176,7 +250,7 @@ except Exception:
     profile = UserProfile()
 
 st.title("🧭 我的国内旅行助手")
-st.caption("仅规划中国大陆行程；高德负责地点与路线验证，酒店由你在官方平台确认和下单。")
+st.caption("仅规划中国大陆行程；高德提供只读查询，可信状态由程序校验，酒店由你在官方平台确认和下单。")
 
 with st.sidebar:
     st.header("运行状态")
@@ -198,19 +272,22 @@ with st.sidebar:
     if st.button("保存本地偏好"):
         try:
             repository.save_profile(
-                UserProfile(
-                    home_city=home_city,
-                    travel_pace=profile_pace,
-                    hotel_budget_min=profile.hotel_budget_min,
-                    hotel_budget_max=profile.hotel_budget_max,
-                    hotel_preferences=csv_list(profile_hotel),
-                    food_restrictions=csv_list(profile_food),
-                    daily_start_time=profile.daily_start_time,
-                    daily_end_time=profile.daily_end_time,
-                    max_daily_walk_km=profile_walk,
+                UserProfile.model_validate(
+                    {
+                        **profile.model_dump(),
+                        "home_city": home_city,
+                        "travel_pace": profile_pace,
+                        "hotel_preferences": csv_list(profile_hotel),
+                        "food_restrictions": csv_list(profile_food),
+                        "max_daily_walk_km": profile_walk,
+                    }
                 )
             )
             st.success("偏好已保存在本机")
+        except SensitiveDataError as exc:
+            st.error(str(exc))
+        except ValidationError as exc:
+            st.error(validation_error_text(exc))
         except Exception as exc:
             st.error(f"保存失败：{type(exc).__name__}")
 
@@ -282,8 +359,12 @@ with plan_tab:
                 label="行程已生成" if result.saved else "行程已生成但未保存",
                 state="complete",
             )
-        except (ValidationError, ValueError) as exc:
-            st.error(f"输入或目的地验证失败：{exc}")
+        except SensitiveDataError as exc:
+            st.error(str(exc))
+        except ValidationError as exc:
+            st.error(validation_error_text(exc))
+        except ValueError:
+            st.error("输入格式或目的地校验失败，请检查对应字段后重试。")
         except Exception as exc:
             st.error(f"生成失败：{type(exc).__name__}。请检查 DeepSeek 配置和服务状态。")
 
@@ -297,20 +378,36 @@ with plan_tab:
                 for activity in day_plan.activities
                 if activity.locked
             ]
+            replan_succeeded = False
             with st.status("正在围绕锁定活动重新规划…", expanded=True) as replan_status:
                 def replan_progress(stage: str, message: str) -> None:
                     replan_status.write(f"**{stage}**：{message}")
 
-                result = asyncio.run(
-                    TravelPlannerWorkflow(settings, repository).generate(
-                        current.request,
-                        replan_progress,
-                        locked_activities=locked,
+                try:
+                    result = asyncio.run(
+                        TravelPlannerWorkflow(settings, repository).generate(
+                            current.request,
+                            replan_progress,
+                            locked_activities=locked,
+                        )
                     )
-                )
-                st.session_state.itinerary = result.itinerary
-                replan_status.update(label="重新规划完成", state="complete")
-            st.rerun()
+                    st.session_state.itinerary = result.itinerary
+                    replan_status.update(label="重新规划完成", state="complete")
+                    replan_succeeded = True
+                except SensitiveDataError as exc:
+                    replan_status.update(label="重新规划已拒绝", state="error")
+                    st.error(str(exc))
+                except ValidationError as exc:
+                    replan_status.update(label="重新规划失败", state="error")
+                    st.error(validation_error_text(exc))
+                except ValueError:
+                    replan_status.update(label="重新规划失败", state="error")
+                    st.error("锁定活动或目的地未通过校验，请检查后重试。")
+                except Exception as exc:
+                    replan_status.update(label="重新规划失败", state="error")
+                    st.error(f"重新规划失败：{type(exc).__name__}")
+            if replan_succeeded:
+                st.rerun()
 
 with history_tab:
     try:
@@ -324,14 +421,23 @@ with history_tab:
         with st.expander(f"{item['start_date']} · {item['title']} · {item['status']}"):
             view_col, copy_col, delete_col = st.columns(3)
             if view_col.button("查看", key=f"view-{item['itinerary_id']}"):
-                st.session_state.itinerary = repository.get_itinerary(item["itinerary_id"])
-                st.rerun()
-            if copy_col.button("复制为新行程", key=f"copy-{item['itinerary_id']}"):
-                selected = repository.get_itinerary(item["itinerary_id"])
-                if selected:
-                    st.session_state.copied_request = selected.request
+                try:
+                    st.session_state.itinerary = repository.get_itinerary(item["itinerary_id"])
                     st.rerun()
+                except Exception as exc:
+                    st.error(f"读取失败：{type(exc).__name__}")
+            if copy_col.button("复制为新行程", key=f"copy-{item['itinerary_id']}"):
+                try:
+                    selected = repository.get_itinerary(item["itinerary_id"])
+                    if selected:
+                        st.session_state.copied_request = selected.request
+                        st.rerun()
+                except Exception as exc:
+                    st.error(f"复制失败：{type(exc).__name__}")
             confirm = delete_col.checkbox("确认删除", key=f"confirm-{item['itinerary_id']}")
             if delete_col.button("删除本地记录", key=f"delete-{item['itinerary_id']}", disabled=not confirm):
-                repository.delete_itinerary(item["itinerary_id"])
-                st.rerun()
+                try:
+                    repository.delete_itinerary(item["itinerary_id"])
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"删除失败：{type(exc).__name__}")
