@@ -1,19 +1,30 @@
 from __future__ import annotations
 
-from datetime import date, time
+from datetime import date, datetime, time
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from travel_planner.models import (
     Activity,
     DayPlan,
+    EvidenceKind,
     Itinerary,
     PoiCandidate,
     RouteLeg,
     SourceEvidence,
     TripRequest,
+    ValidationContext,
     VerificationStatus,
 )
+
+
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+
+
+@pytest.fixture
+def fixed_now() -> datetime:
+    return datetime(2026, 10, 1, 10, 0, tzinfo=BEIJING_TZ)
 
 
 @pytest.fixture
@@ -31,7 +42,7 @@ def trip_request() -> TripRequest:
 
 
 @pytest.fixture
-def verified_poi() -> PoiCandidate:
+def verified_poi(fixed_now) -> PoiCandidate:
     return PoiCandidate(
         poi_id="B000A83M61",
         name="示例景点",
@@ -39,16 +50,31 @@ def verified_poi() -> PoiCandidate:
         longitude=116.397,
         latitude=39.908,
         evidence=SourceEvidence(
+            kind=EvidenceKind.POI_LOCATION,
             source="高德地图",
             tool_name="maps_search_detail",
+            tool_call_id="call-poi-1",
+            raw_identifier="B000A83M61",
+            checked_at=fixed_now,
             status=VerificationStatus.VERIFIED,
         ),
     )
 
 
 @pytest.fixture
-def verified_itinerary(trip_request, verified_poi) -> Itinerary:
-    second = verified_poi.model_copy(update={"poi_id": "B000SECOND", "name": "第二景点"})
+def verified_itinerary(trip_request, verified_poi, fixed_now) -> Itinerary:
+    second = verified_poi.model_copy(
+        update={
+            "poi_id": "B000SECOND",
+            "name": "第二景点",
+            "evidence": verified_poi.evidence.model_copy(
+                update={
+                    "tool_call_id": "call-poi-2",
+                    "raw_identifier": "B000SECOND",
+                }
+            ),
+        }
+    )
     first_activity = Activity(
         day=trip_request.start_date,
         start_time=time(9, 0),
@@ -70,8 +96,12 @@ def verified_itinerary(trip_request, verified_poi) -> Itinerary:
         distance_meters=3000,
         duration_minutes=30,
         evidence=SourceEvidence(
+            kind=EvidenceKind.ROUTE,
             source="高德地图",
             tool_name="route_planning",
+            tool_call_id="call-route-1",
+            raw_identifier="route-1",
+            checked_at=fixed_now,
             status=VerificationStatus.VERIFIED,
         ),
     )
@@ -87,5 +117,25 @@ def verified_itinerary(trip_request, verified_poi) -> Itinerary:
                 route_legs=[route],
             )
         ],
+    )
+
+
+@pytest.fixture
+def validation_context(verified_itinerary, fixed_now) -> ValidationContext:
+    return ValidationContext(
+        now=fixed_now,
+        destination_confirmed=True,
+        approved_poi_ids={
+            activity.poi.poi_id
+            for day_plan in verified_itinerary.days
+            for activity in day_plan.activities
+        },
+        required_stages={
+            "normalize_request": True,
+            "research_destination": True,
+            "create_draft": True,
+            "enrich_routes": True,
+            "validate": True,
+        },
     )
 
